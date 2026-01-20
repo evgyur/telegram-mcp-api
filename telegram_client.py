@@ -17,7 +17,11 @@ Usage:
 """
 
 import json
+import time
+import random
+import re
 from typing import Optional, List, Union, Any, Dict
+from datetime import datetime, timedelta
 import httpx
 
 
@@ -26,20 +30,56 @@ class TelegramClientError(Exception):
     pass
 
 
+class RateLimitError(Exception):
+    """Exception raised when rate limit is exceeded."""
+    def __init__(self, message: str, retry_after: float = 1.0):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class FloodWaitError(Exception):
+    """Exception raised when Telegram requires waiting (FLOOD_WAIT)."""
+    def __init__(self, message: str, wait_time: float = 1.0):
+        super().__init__(message)
+        self.wait_time = wait_time
+        self.retry_after = wait_time  # Для совместимости с RateLimitError
+
+
 class TelegramClient:
     """Client for interacting with the Telegram HTTP API."""
 
-    def __init__(self, base_url: str = "http://localhost:8080", timeout: float = 30.0):
+    def __init__(
+        self,
+        base_url: str = "http://localhost:8080",
+        timeout: float = 30.0,
+        min_request_delay: float = 0.2,  # Минимальная задержка между запросами (5 req/s)
+        max_retries: int = 3,
+    ):
         """
         Initialize the Telegram client.
 
         Args:
             base_url: The base URL of the Telegram API server.
             timeout: Request timeout in seconds.
+            min_request_delay: Минимальная задержка между запросами в секундах (по умолчанию 0.2 = 5 req/s).
+            max_retries: Максимальное количество повторных попыток при ошибках.
         """
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.min_request_delay = min_request_delay
+        self.max_retries = max_retries
         self._client = httpx.Client(timeout=timeout)
+        
+        # Отслеживание времени последнего запроса
+        self._last_request_time: Optional[float] = None
+        
+        # Отслеживание времени последнего сообщения в каждом чате (для лимита 1 msg/s)
+        self._last_message_time_per_chat: Dict[Union[int, str], float] = {}
+        
+        # Отслеживание времени последнего редактирования (лимит 5 edits/s, 120 edits/hour)
+        self._last_edit_time: Optional[float] = None
+        self._edit_count_last_hour: int = 0
+        self._edit_count_reset_time: Optional[float] = None
 
     def __enter__(self):
         return self
@@ -51,48 +91,267 @@ class TelegramClient:
         """Close the HTTP client."""
         self._client.close()
 
+    def _wait_for_rate_limit(self):
+        """Ожидание перед следующим запросом для соблюдения rate limits."""
+        current_time = time.time()
+        
+        if self._last_request_time is not None:
+            elapsed = current_time - self._last_request_time
+            if elapsed < self.min_request_delay:
+                sleep_time = self.min_request_delay - elapsed
+                # Добавляем небольшой jitter для избежания синхронизации
+                sleep_time += random.uniform(0, 0.05)
+                time.sleep(sleep_time)
+        
+        self._last_request_time = time.time()
+
+    def _extract_flood_wait_time(self, error_msg: str, result: Dict) -> float:
+        """
+        Извлечение времени ожидания из FLOOD_WAIT ошибки.
+        
+        Args:
+            error_msg: Текст ошибки
+            result: Полный ответ API
+            
+        Returns:
+            Время ожидания в секундах
+        """
+        wait_time = 1.0  # По умолчанию 1 секунда
+        
+        # Пытаемся извлечь из parameters
+        parameters = result.get("parameters", {})
+        if isinstance(parameters, dict):
+            seconds = parameters.get("seconds") or parameters.get("retry_after")
+            if seconds:
+                wait_time = float(seconds)
+        
+        # Пытаемся извлечь из текста ошибки (формат: FLOOD_WAIT_123)
+        match = re.search(r'FLOOD_WAIT[_\s]+(\d+)', str(error_msg).upper())
+        if match:
+            wait_time = float(match.group(1))
+        
+        # Ограничиваем максимальное время ожидания 3600 секундами (1 час)
+        wait_time = min(wait_time, 3600.0)
+        
+        return wait_time
+
+    def _handle_rate_limit_error(self, response: httpx.Response, attempt: int) -> float:
+        """
+        Обработка ошибки 429 (Rate Limit).
+        
+        Returns:
+            Время ожидания до следующей попытки в секундах.
+        """
+        retry_after = 1.0  # По умолчанию 1 секунда
+        
+        try:
+            # Пытаемся получить retry_after из ответа
+            error_data = response.json()
+            if isinstance(error_data, dict):
+                # Может быть в разных форматах
+                retry_after = error_data.get("retry_after", error_data.get("parameters", {}).get("retry_after", 1.0))
+                if isinstance(retry_after, (int, float)):
+                    retry_after = float(retry_after)
+                else:
+                    retry_after = 1.0
+        except (ValueError, KeyError, TypeError):
+            pass
+        
+        # Проверяем заголовки
+        if "Retry-After" in response.headers:
+            try:
+                retry_after = float(response.headers["Retry-After"])
+            except (ValueError, TypeError):
+                pass
+        
+        # Exponential backoff с jitter
+        backoff_time = retry_after * (2 ** attempt)
+        # Добавляем jitter (0-25% от времени ожидания)
+        jitter = random.uniform(0, backoff_time * 0.25)
+        total_wait = backoff_time + jitter
+        
+        # Ограничиваем максимальное время ожидания 60 секундами
+        total_wait = min(total_wait, 60.0)
+        
+        return total_wait
+
+    def _check_edit_rate_limit(self):
+        """Проверка лимита редактирования (5 edits/s, 120 edits/hour)."""
+        current_time = time.time()
+        
+        # Сброс счетчика каждый час
+        if self._edit_count_reset_time is None or current_time >= self._edit_count_reset_time:
+            self._edit_count_last_hour = 0
+            self._edit_count_reset_time = current_time + 3600
+        
+        # Проверка лимита 120 редактирований в час
+        if self._edit_count_last_hour >= 120:
+            wait_time = self._edit_count_reset_time - current_time
+            if wait_time > 0:
+                raise RateLimitError(
+                    f"Edit rate limit exceeded: 120 edits/hour. Wait {wait_time:.1f} seconds.",
+                    retry_after=wait_time
+                )
+        
+        # Проверка лимита 5 редактирований в секунду
+        if self._last_edit_time is not None:
+            elapsed = current_time - self._last_edit_time
+            if elapsed < 0.2:  # 5 edits/s = 1 edit per 0.2s
+                sleep_time = 0.2 - elapsed + random.uniform(0, 0.02)
+                time.sleep(sleep_time)
+        
+        self._last_edit_time = time.time()
+        self._edit_count_last_hour += 1
+
+    def _check_message_rate_limit(self, chat_id: Union[int, str]):
+        """Проверка лимита отправки сообщений (1 msg/s в один чат)."""
+        current_time = time.time()
+        
+        if chat_id in self._last_message_time_per_chat:
+            elapsed = current_time - self._last_message_time_per_chat[chat_id]
+            if elapsed < 1.0:  # Минимум 1 секунда между сообщениями в один чат
+                sleep_time = 1.0 - elapsed + random.uniform(0, 0.1)
+                time.sleep(sleep_time)
+        
+        self._last_message_time_per_chat[chat_id] = time.time()
+
     def _request(
         self,
         method: str,
         endpoint: str,
         params: Optional[Dict] = None,
         json_data: Optional[Dict] = None,
+        check_message_rate_limit: bool = False,
+        chat_id: Optional[Union[int, str]] = None,
+        is_edit: bool = False,
     ) -> Any:
-        """Make an HTTP request to the API."""
+        """
+        Make an HTTP request to the API with rate limiting protection.
+        
+        Args:
+            method: HTTP method (GET, POST, etc.)
+            endpoint: API endpoint
+            params: URL parameters
+            json_data: JSON body data
+            check_message_rate_limit: Проверять лимит сообщений для чата
+            chat_id: ID чата для проверки лимита сообщений
+            is_edit: Является ли запрос редактированием сообщения
+        """
+        # Проверка лимита редактирования
+        if is_edit:
+            self._check_edit_rate_limit()
+        
+        # Проверка лимита сообщений для конкретного чата
+        if check_message_rate_limit and chat_id is not None:
+            self._check_message_rate_limit(chat_id)
+        
+        # Ожидание перед запросом для соблюдения общего rate limit
+        self._wait_for_rate_limit()
+        
         url = f"{self.base_url}{endpoint}"
-
-        response = self._client.request(
-            method=method,
-            url=url,
-            params=params,
-            json=json_data,
-        )
-        response.raise_for_status()
-
-        result = response.json()
-
-        if not result.get("success"):
-            raise TelegramClientError(result.get("error", "Unknown error"))
-
-        data = result.get("data")
-        if data:
+        
+        # Повторные попытки с exponential backoff
+        last_exception = None
+        for attempt in range(self.max_retries + 1):
             try:
-                return json.loads(data)
-            except (json.JSONDecodeError, TypeError):
+                response = self._client.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    json=json_data,
+                )
+                
+                # Обработка ошибки 429 (Rate Limit)
+                if response.status_code == 429:
+                    wait_time = self._handle_rate_limit_error(response, attempt)
+                    
+                    if attempt < self.max_retries:
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        raise RateLimitError(
+                            f"Rate limit exceeded after {self.max_retries} retries. "
+                            f"Wait {wait_time:.1f} seconds before next request.",
+                            retry_after=wait_time
+                        )
+                
+                response.raise_for_status()
+                
+                result = response.json()
+                
+                if not result.get("success"):
+                    error_msg = result.get("error", "Unknown error")
+                    error_code = result.get("error_code", "")
+                    
+                    # Обработка FLOOD_WAIT ошибки
+                    if "FLOOD_WAIT" in str(error_code).upper() or "FLOOD_WAIT" in str(error_msg).upper():
+                        wait_time = self._extract_flood_wait_time(error_msg, result)
+                        
+                        if attempt < self.max_retries:
+                            # Автоматически ждем и повторяем
+                            time.sleep(wait_time + random.uniform(0, 1))  # Добавляем jitter
+                            continue
+                        else:
+                            raise FloodWaitError(
+                                f"Flood wait required: {error_msg}. "
+                                f"Wait {wait_time:.1f} seconds before next request.",
+                                wait_time=wait_time
+                            )
+                    
+                    raise TelegramClientError(error_msg)
+                
+                data = result.get("data")
+                if data:
+                    try:
+                        return json.loads(data)
+                    except (json.JSONDecodeError, TypeError):
+                        return data
                 return data
-        return data
+                
+            except FloodWaitError as e:
+                # FloodWaitError уже обработан выше, но если дошли сюда - все попытки исчерпаны
+                raise
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    # Уже обработано выше
+                    continue
+                last_exception = e
+                if attempt < self.max_retries:
+                    # Exponential backoff для других HTTP ошибок
+                    wait_time = (2 ** attempt) + random.uniform(0, 1)
+                    time.sleep(wait_time)
+                    continue
+                raise
+            except (httpx.RequestError, httpx.TimeoutException) as e:
+                last_exception = e
+                if attempt < self.max_retries:
+                    wait_time = (2 ** attempt) + random.uniform(0, 1)
+                    time.sleep(wait_time)
+                    continue
+                raise
+        
+        # Если дошли сюда, значит все попытки исчерпаны
+        if last_exception:
+            raise last_exception
+        raise TelegramClientError("Request failed after all retries")
 
     def _get(self, endpoint: str, **params) -> Any:
         """Make a GET request."""
         return self._request("GET", endpoint, params=params)
 
-    def _post(self, endpoint: str, **data) -> Any:
+    def _post(self, endpoint: str, check_message_rate_limit: bool = False, chat_id: Optional[Union[int, str]] = None, **data) -> Any:
         """Make a POST request."""
-        return self._request("POST", endpoint, json_data=data)
+        return self._request(
+            "POST",
+            endpoint,
+            json_data=data,
+            check_message_rate_limit=check_message_rate_limit,
+            chat_id=chat_id
+        )
 
-    def _put(self, endpoint: str, **data) -> Any:
+    def _put(self, endpoint: str, is_edit: bool = False, **data) -> Any:
         """Make a PUT request."""
-        return self._request("PUT", endpoint, json_data=data)
+        return self._request("PUT", endpoint, json_data=data, is_edit=is_edit)
 
     def _delete(self, endpoint: str, **data) -> Any:
         """Make a DELETE request."""
@@ -146,23 +405,29 @@ class TelegramClient:
         reply_to: Optional[int] = None,
         parse_mode: Optional[str] = None,
     ) -> str:
-        """Send a message to a chat."""
+        """Send a message to a chat with rate limiting protection."""
         data = {"chat_id": chat_id, "message": message}
         if reply_to:
             data["reply_to"] = reply_to
         if parse_mode:
             data["parse_mode"] = parse_mode
-        return self._post("/messages/send", **data)
+        return self._post(
+            "/messages/send",
+            **data,
+            check_message_rate_limit=True,
+            chat_id=chat_id
+        )
 
     def edit_message(
         self, chat_id: Union[int, str], message_id: int, new_text: str
     ) -> str:
-        """Edit an existing message."""
+        """Edit an existing message with rate limiting protection."""
         return self._put(
             "/messages/edit",
             chat_id=chat_id,
             message_id=message_id,
             new_text=new_text,
+            is_edit=True
         )
 
     def delete_message(
@@ -179,12 +444,14 @@ class TelegramClient:
     def forward_message(
         self, from_chat_id: Union[int, str], to_chat_id: Union[int, str], message_id: int
     ) -> str:
-        """Forward a message from one chat to another."""
+        """Forward a message from one chat to another with rate limiting protection."""
         return self._post(
             "/messages/forward",
             from_chat_id=from_chat_id,
             to_chat_id=to_chat_id,
             message_id=message_id,
+            check_message_rate_limit=True,
+            chat_id=to_chat_id  # Лимит применяется к целевому чату
         )
 
     def search_messages(

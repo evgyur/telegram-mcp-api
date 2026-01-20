@@ -9,7 +9,9 @@ import os
 import json
 import logging
 import re
-from datetime import datetime
+import asyncio
+import random
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import List, Dict, Optional, Union, Any
 from functools import wraps
@@ -18,6 +20,7 @@ from dotenv import load_dotenv
 from pythonjsonlogger import jsonlogger
 from telethon import TelegramClient, functions, utils
 from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError as TelethonFloodWaitError
 from telethon.tl.types import (
     User,
     Chat,
@@ -236,6 +239,14 @@ class TelegramCore:
     def __init__(self):
         self.client: Optional[TelegramClient] = None
         self._started = False
+        
+        # Rate limiting tracking
+        self._last_request_time: Optional[float] = None
+        self._last_message_time_per_chat: Dict[Union[int, str], float] = {}
+        self._last_edit_time: Optional[float] = None
+        self._edit_count_last_hour: int = 0
+        self._edit_count_reset_time: Optional[float] = None
+        self.min_request_delay: float = 0.2  # 5 req/s
 
     async def start(self):
         """Initialize and start the Telegram client."""
@@ -259,6 +270,67 @@ class TelegramCore:
         if self.client and self._started:
             await self.client.disconnect()
             self._started = False
+
+    # ==================== Rate Limiting ====================
+    
+    async def _wait_for_rate_limit(self):
+        """Ожидание перед следующим запросом для соблюдения rate limits."""
+        import time
+        current_time = time.time()
+        
+        if self._last_request_time is not None:
+            elapsed = current_time - self._last_request_time
+            if elapsed < self.min_request_delay:
+                sleep_time = self.min_request_delay - elapsed
+                # Добавляем небольшой jitter для избежания синхронизации
+                sleep_time += random.uniform(0, 0.05)
+                await asyncio.sleep(sleep_time)
+        
+        self._last_request_time = time.time()
+
+    async def _check_edit_rate_limit(self):
+        """Проверка лимита редактирования (5 edits/s, 120 edits/hour)."""
+        import time
+        current_time = time.time()
+        
+        # Сброс счетчика каждый час
+        if self._edit_count_reset_time is None or current_time >= self._edit_count_reset_time:
+            self._edit_count_last_hour = 0
+            self._edit_count_reset_time = current_time + 3600
+        
+        # Проверка лимита 120 редактирований в час
+        if self._edit_count_last_hour >= 120:
+            wait_time = self._edit_count_reset_time - current_time
+            if wait_time > 0:
+                await asyncio.sleep(wait_time)
+                # Пересчитываем после ожидания
+                current_time = time.time()
+                if current_time >= self._edit_count_reset_time:
+                    self._edit_count_last_hour = 0
+                    self._edit_count_reset_time = current_time + 3600
+        
+        # Проверка лимита 5 редактирований в секунду
+        if self._last_edit_time is not None:
+            elapsed = current_time - self._last_edit_time
+            if elapsed < 0.2:  # 5 edits/s = 1 edit per 0.2s
+                sleep_time = 0.2 - elapsed + random.uniform(0, 0.02)
+                await asyncio.sleep(sleep_time)
+        
+        self._last_edit_time = time.time()
+        self._edit_count_last_hour += 1
+
+    async def _check_message_rate_limit(self, chat_id: Union[int, str]):
+        """Проверка лимита отправки сообщений (1 msg/s в один чат)."""
+        import time
+        current_time = time.time()
+        
+        if chat_id in self._last_message_time_per_chat:
+            elapsed = current_time - self._last_message_time_per_chat[chat_id]
+            if elapsed < 1.0:  # Минимум 1 секунда между сообщениями в один чат
+                sleep_time = 1.0 - elapsed + random.uniform(0, 0.1)
+                await asyncio.sleep(sleep_time)
+        
+        self._last_message_time_per_chat[chat_id] = time.time()
 
     # ==================== Chat Operations ====================
 
@@ -376,10 +448,16 @@ class TelegramCore:
         reply_to: Optional[int] = None,
         parse_mode: Optional[str] = None,
     ) -> str:
-        """Send a message to a chat."""
+        """Send a message to a chat with rate limiting protection."""
         chat_id, error = validate_ids("chat_id", chat_id)
         if error:
             return error
+
+        # Проверка лимита сообщений для конкретного чата
+        await self._check_message_rate_limit(chat_id)
+        
+        # Ожидание перед запросом для соблюдения общего rate limit
+        await self._wait_for_rate_limit()
 
         try:
             entity = await self.client.get_entity(chat_id)
@@ -387,21 +465,51 @@ class TelegramCore:
                 entity, message, reply_to=reply_to, parse_mode=parse_mode
             )
             return f"Message sent successfully. Message ID: {result.id}"
+        except TelethonFloodWaitError as e:
+            # Обработка FLOOD_WAIT от Telethon
+            wait_time = min(float(e.seconds), 3600.0)  # Максимум 1 час
+            await asyncio.sleep(wait_time + random.uniform(0, 1))
+            # Повторная попытка после ожидания
+            try:
+                entity = await self.client.get_entity(chat_id)
+                result = await self.client.send_message(
+                    entity, message, reply_to=reply_to, parse_mode=parse_mode
+                )
+                return f"Message sent successfully. Message ID: {result.id}"
+            except Exception as retry_e:
+                return log_and_format_error("send_message", retry_e, chat_id=chat_id)
         except Exception as e:
             return log_and_format_error("send_message", e, chat_id=chat_id)
 
     async def edit_message(
         self, chat_id: Union[int, str], message_id: int, new_text: str
     ) -> str:
-        """Edit a message."""
+        """Edit a message with rate limiting protection."""
         chat_id, error = validate_ids("chat_id", chat_id)
         if error:
             return error
+
+        # Проверка лимита редактирования
+        await self._check_edit_rate_limit()
+        
+        # Ожидание перед запросом для соблюдения общего rate limit
+        await self._wait_for_rate_limit()
 
         try:
             entity = await self.client.get_entity(chat_id)
             await self.client.edit_message(entity, message_id, new_text)
             return f"Message {message_id} edited successfully."
+        except TelethonFloodWaitError as e:
+            # Обработка FLOOD_WAIT от Telethon
+            wait_time = min(float(e.seconds), 3600.0)  # Максимум 1 час
+            await asyncio.sleep(wait_time + random.uniform(0, 1))
+            # Повторная попытка после ожидания
+            try:
+                entity = await self.client.get_entity(chat_id)
+                await self.client.edit_message(entity, message_id, new_text)
+                return f"Message {message_id} edited successfully."
+            except Exception as retry_e:
+                return log_and_format_error("edit_message", retry_e, chat_id=chat_id, message_id=message_id)
         except Exception as e:
             return log_and_format_error("edit_message", e, chat_id=chat_id, message_id=message_id)
 
@@ -423,7 +531,7 @@ class TelegramCore:
     async def forward_message(
         self, from_chat_id: Union[int, str], to_chat_id: Union[int, str], message_id: int
     ) -> str:
-        """Forward a message from one chat to another."""
+        """Forward a message from one chat to another with rate limiting protection."""
         from_chat_id, error = validate_ids("from_chat_id", from_chat_id)
         if error:
             return error
@@ -431,11 +539,31 @@ class TelegramCore:
         if error:
             return error
 
+        # Проверка лимита сообщений для целевого чата
+        await self._check_message_rate_limit(to_chat_id)
+        
+        # Ожидание перед запросом для соблюдения общего rate limit
+        await self._wait_for_rate_limit()
+
         try:
             from_entity = await self.client.get_entity(from_chat_id)
             to_entity = await self.client.get_entity(to_chat_id)
             result = await self.client.forward_messages(to_entity, message_id, from_entity)
             return f"Message forwarded successfully. New message ID: {result[0].id}"
+        except TelethonFloodWaitError as e:
+            # Обработка FLOOD_WAIT от Telethon
+            wait_time = min(float(e.seconds), 3600.0)  # Максимум 1 час
+            await asyncio.sleep(wait_time + random.uniform(0, 1))
+            # Повторная попытка после ожидания
+            try:
+                from_entity = await self.client.get_entity(from_chat_id)
+                to_entity = await self.client.get_entity(to_chat_id)
+                result = await self.client.forward_messages(to_entity, message_id, from_entity)
+                return f"Message forwarded successfully. New message ID: {result[0].id}"
+            except Exception as retry_e:
+                return log_and_format_error(
+                    "forward_message", retry_e, from_chat_id=from_chat_id, to_chat_id=to_chat_id
+                )
         except Exception as e:
             return log_and_format_error(
                 "forward_message", e, from_chat_id=from_chat_id, to_chat_id=to_chat_id
