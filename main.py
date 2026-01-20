@@ -6,6 +6,7 @@ import asyncio
 import sqlite3
 import logging
 import mimetypes
+import random
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import List, Dict, Optional, Union, Any
@@ -18,6 +19,7 @@ from mcp.types import ToolAnnotations
 from pythonjsonlogger import jsonlogger
 from telethon import TelegramClient, functions, utils
 from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError as TelethonFloodWaitError
 from telethon.tl.types import (
     User,
     Chat,
@@ -71,6 +73,68 @@ if SESSION_STRING:
 else:
     # Use file-based session
     client = TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+
+# Rate limiting tracking for MCP server
+_mcp_last_request_time: Optional[float] = None
+_mcp_last_message_time_per_chat: Dict[Union[int, str], float] = {}
+_mcp_last_edit_time: Optional[float] = None
+_mcp_edit_count_last_hour: int = 0
+_mcp_edit_count_reset_time: Optional[float] = None
+_mcp_min_request_delay: float = 0.2  # 5 req/s
+
+async def _mcp_wait_for_rate_limit():
+    """Ожидание перед следующим запросом для соблюдения rate limits."""
+    global _mcp_last_request_time
+    current_time = time.time()
+    
+    if _mcp_last_request_time is not None:
+        elapsed = current_time - _mcp_last_request_time
+        if elapsed < _mcp_min_request_delay:
+            sleep_time = _mcp_min_request_delay - elapsed
+            sleep_time += random.uniform(0, 0.05)
+            await asyncio.sleep(sleep_time)
+    
+    _mcp_last_request_time = time.time()
+
+async def _mcp_check_edit_rate_limit():
+    """Проверка лимита редактирования (5 edits/s, 120 edits/hour)."""
+    global _mcp_last_edit_time, _mcp_edit_count_last_hour, _mcp_edit_count_reset_time
+    current_time = time.time()
+    
+    if _mcp_edit_count_reset_time is None or current_time >= _mcp_edit_count_reset_time:
+        _mcp_edit_count_last_hour = 0
+        _mcp_edit_count_reset_time = current_time + 3600
+    
+    if _mcp_edit_count_last_hour >= 120:
+        wait_time = _mcp_edit_count_reset_time - current_time
+        if wait_time > 0:
+            await asyncio.sleep(wait_time)
+            current_time = time.time()
+            if current_time >= _mcp_edit_count_reset_time:
+                _mcp_edit_count_last_hour = 0
+                _mcp_edit_count_reset_time = current_time + 3600
+    
+    if _mcp_last_edit_time is not None:
+        elapsed = current_time - _mcp_last_edit_time
+        if elapsed < 0.2:
+            sleep_time = 0.2 - elapsed + random.uniform(0, 0.02)
+            await asyncio.sleep(sleep_time)
+    
+    _mcp_last_edit_time = time.time()
+    _mcp_edit_count_last_hour += 1
+
+async def _mcp_check_message_rate_limit(chat_id: Union[int, str]):
+    """Проверка лимита отправки сообщений (1 msg/s в один чат)."""
+    global _mcp_last_message_time_per_chat
+    current_time = time.time()
+    
+    if chat_id in _mcp_last_message_time_per_chat:
+        elapsed = current_time - _mcp_last_message_time_per_chat[chat_id]
+        if elapsed < 1.0:
+            sleep_time = 1.0 - elapsed + random.uniform(0, 0.1)
+            await asyncio.sleep(sleep_time)
+    
+    _mcp_last_message_time_per_chat[chat_id] = time.time()
 
 # Setup robust logging with both file and console output
 logger = logging.getLogger("telegram_mcp")
@@ -407,9 +471,22 @@ async def send_message(chat_id: Union[int, str], message: str) -> str:
         message: The message content to send.
     """
     try:
+        # Rate limiting protection
+        await _mcp_check_message_rate_limit(chat_id)
+        await _mcp_wait_for_rate_limit()
+        
         entity = await client.get_entity(chat_id)
         await client.send_message(entity, message)
         return "Message sent successfully."
+    except TelethonFloodWaitError as e:
+        wait_time = min(float(e.seconds), 3600.0)
+        await asyncio.sleep(wait_time + random.uniform(0, 1))
+        try:
+            entity = await client.get_entity(chat_id)
+            await client.send_message(entity, message)
+            return "Message sent successfully."
+        except Exception as retry_e:
+            return log_and_format_error("send_message", retry_e, chat_id=chat_id)
     except Exception as e:
         return log_and_format_error("send_message", e, chat_id=chat_id)
 
@@ -1659,9 +1736,25 @@ async def send_file(chat_id: Union[int, str], file_path: str, caption: str = Non
             return f"File not found: {file_path}"
         if not os.access(file_path, os.R_OK):
             return f"File is not readable: {file_path}"
+
+        # Rate limiting protection
+        await _mcp_check_message_rate_limit(chat_id)
+        await _mcp_wait_for_rate_limit()
+
         entity = await client.get_entity(chat_id)
         await client.send_file(entity, file_path, caption=caption)
         return f"File sent to chat {chat_id}."
+    except TelethonFloodWaitError as e:
+        wait_time = min(float(e.seconds), 3600.0)
+        await asyncio.sleep(wait_time + random.uniform(0, 1))
+        try:
+            entity = await client.get_entity(chat_id)
+            await client.send_file(entity, file_path, caption=caption)
+            return f"File sent to chat {chat_id}."
+        except Exception as retry_e:
+            return log_and_format_error(
+                "send_file", retry_e, chat_id=chat_id, file_path=file_path, caption=caption
+            )
     except Exception as e:
         return log_and_format_error(
             "send_file", e, chat_id=chat_id, file_path=file_path, caption=caption
@@ -2547,9 +2640,22 @@ async def send_voice(chat_id: Union[int, str], file_path: str) -> str:
         ):
             return "Voice file must be .ogg or .opus format."
 
+        # Rate limiting protection
+        await _mcp_check_message_rate_limit(chat_id)
+        await _mcp_wait_for_rate_limit()
+
         entity = await client.get_entity(chat_id)
         await client.send_file(entity, file_path, voice_note=True)
         return f"Voice message sent to chat {chat_id}."
+    except TelethonFloodWaitError as e:
+        wait_time = min(float(e.seconds), 3600.0)
+        await asyncio.sleep(wait_time + random.uniform(0, 1))
+        try:
+            entity = await client.get_entity(chat_id)
+            await client.send_file(entity, file_path, voice_note=True)
+            return f"Voice message sent to chat {chat_id}."
+        except Exception as retry_e:
+            return log_and_format_error("send_voice", retry_e, chat_id=chat_id, file_path=file_path)
     except Exception as e:
         return log_and_format_error("send_voice", e, chat_id=chat_id, file_path=file_path)
 
@@ -2565,14 +2671,26 @@ async def forward_message(
     Forward a message from one chat to another.
     """
     try:
+        # Rate limiting protection
+        await _mcp_check_message_rate_limit(to_chat_id)
+        await _mcp_wait_for_rate_limit()
+        
         from_entity = await client.get_entity(from_chat_id)
         to_entity = await client.get_entity(to_chat_id)
         await client.forward_messages(to_entity, message_id, from_entity)
         return f"Message {message_id} forwarded from {from_chat_id} to {to_chat_id}."
-    except Exception as e:
-        return log_and_format_error(
-            "forward_message",
-            e,
+    except TelethonFloodWaitError as e:
+        wait_time = min(float(e.seconds), 3600.0)
+        await asyncio.sleep(wait_time + random.uniform(0, 1))
+        try:
+            from_entity = await client.get_entity(from_chat_id)
+            to_entity = await client.get_entity(to_chat_id)
+            await client.forward_messages(to_entity, message_id, from_entity)
+            return f"Message {message_id} forwarded from {from_chat_id} to {to_chat_id}."
+        except Exception as retry_e:
+            return log_and_format_error(
+                "forward_message",
+                retry_e,
             from_chat_id=from_chat_id,
             message_id=message_id,
             to_chat_id=to_chat_id,
@@ -2590,9 +2708,24 @@ async def edit_message(chat_id: Union[int, str], message_id: int, new_text: str)
     Edit a message you sent.
     """
     try:
+        # Rate limiting protection
+        await _mcp_check_edit_rate_limit()
+        await _mcp_wait_for_rate_limit()
+        
         entity = await client.get_entity(chat_id)
         await client.edit_message(entity, message_id, new_text)
         return f"Message {message_id} edited."
+    except TelethonFloodWaitError as e:
+        wait_time = min(float(e.seconds), 3600.0)
+        await asyncio.sleep(wait_time + random.uniform(0, 1))
+        try:
+            entity = await client.get_entity(chat_id)
+            await client.edit_message(entity, message_id, new_text)
+            return f"Message {message_id} edited."
+        except Exception as retry_e:
+            return log_and_format_error(
+                "edit_message", retry_e, chat_id=chat_id, message_id=message_id, new_text=new_text
+            )
     except Exception as e:
         return log_and_format_error(
             "edit_message", e, chat_id=chat_id, message_id=message_id, new_text=new_text
@@ -2680,9 +2813,24 @@ async def reply_to_message(chat_id: Union[int, str], message_id: int, text: str)
     Reply to a specific message in a chat.
     """
     try:
+        # Rate limiting protection
+        await _mcp_check_message_rate_limit(chat_id)
+        await _mcp_wait_for_rate_limit()
+        
         entity = await client.get_entity(chat_id)
         await client.send_message(entity, text, reply_to=message_id)
         return f"Replied to message {message_id} in chat {chat_id}."
+    except TelethonFloodWaitError as e:
+        wait_time = min(float(e.seconds), 3600.0)
+        await asyncio.sleep(wait_time + random.uniform(0, 1))
+        try:
+            entity = await client.get_entity(chat_id)
+            await client.send_message(entity, text, reply_to=message_id)
+            return f"Replied to message {message_id} in chat {chat_id}."
+        except Exception as retry_e:
+            return log_and_format_error(
+                "reply_to_message", retry_e, chat_id=chat_id, message_id=message_id, text=text
+            )
     except Exception as e:
         return log_and_format_error(
             "reply_to_message", e, chat_id=chat_id, message_id=message_id, text=text
@@ -2931,9 +3079,22 @@ async def send_sticker(chat_id: Union[int, str], file_path: str) -> str:
         if not file_path.lower().endswith(".webp"):
             return "Sticker file must be a .webp file."
 
+        # Rate limiting protection
+        await _mcp_check_message_rate_limit(chat_id)
+        await _mcp_wait_for_rate_limit()
+
         entity = await client.get_entity(chat_id)
         await client.send_file(entity, file_path, force_document=False)
         return f"Sticker sent to chat {chat_id}."
+    except TelethonFloodWaitError as e:
+        wait_time = min(float(e.seconds), 3600.0)
+        await asyncio.sleep(wait_time + random.uniform(0, 1))
+        try:
+            entity = await client.get_entity(chat_id)
+            await client.send_file(entity, file_path, force_document=False)
+            return f"Sticker sent to chat {chat_id}."
+        except Exception as retry_e:
+            return log_and_format_error("send_sticker", retry_e, chat_id=chat_id, file_path=file_path)
     except Exception as e:
         return log_and_format_error("send_sticker", e, chat_id=chat_id, file_path=file_path)
 
@@ -3009,9 +3170,23 @@ async def send_gif(chat_id: Union[int, str], gif_id: int) -> str:
     try:
         if not isinstance(gif_id, int):
             return "gif_id must be a Telegram document ID (integer), not a file path. Use get_gif_search to find IDs."
+
+        # Rate limiting protection
+        await _mcp_check_message_rate_limit(chat_id)
+        await _mcp_wait_for_rate_limit()
+
         entity = await client.get_entity(chat_id)
         await client.send_file(entity, gif_id)
         return f"GIF sent to chat {chat_id}."
+    except TelethonFloodWaitError as e:
+        wait_time = min(float(e.seconds), 3600.0)
+        await asyncio.sleep(wait_time + random.uniform(0, 1))
+        try:
+            entity = await client.get_entity(chat_id)
+            await client.send_file(entity, gif_id)
+            return f"GIF sent to chat {chat_id}."
+        except Exception as retry_e:
+            return log_and_format_error("send_gif", retry_e, chat_id=chat_id, gif_id=gif_id)
     except Exception as e:
         return log_and_format_error("send_gif", e, chat_id=chat_id, gif_id=gif_id)
 
@@ -3273,6 +3448,10 @@ async def create_poll(
             except ValueError:
                 return f"Invalid close_date format. Use YYYY-MM-DD HH:MM:SS format."
 
+        # Rate limiting protection
+        await _mcp_check_message_rate_limit(chat_id)
+        await _mcp_wait_for_rate_limit()
+
         # Create the poll using InputMediaPoll with SendMediaRequest
         from telethon.tl.types import InputMediaPoll, Poll, PollAnswer, TextWithEntities
         import random
@@ -3300,6 +3479,37 @@ async def create_poll(
         )
 
         return f"Poll created successfully in chat {chat_id}."
+    except TelethonFloodWaitError as e:
+        wait_time = min(float(e.seconds), 3600.0)
+        await asyncio.sleep(wait_time + random.uniform(0, 1))
+        try:
+            entity = await client.get_entity(chat_id)
+            from telethon.tl.types import InputMediaPoll, Poll, PollAnswer, TextWithEntities
+            poll = Poll(
+                id=random.randint(0, 2**63 - 1),
+                question=TextWithEntities(text=question, entities=[]),
+                answers=[
+                    PollAnswer(text=TextWithEntities(text=option, entities=[]), option=bytes([i]))
+                    for i, option in enumerate(options)
+                ],
+                multiple_choice=multiple_choice,
+                quiz=quiz_mode,
+                public_voters=public_votes,
+                close_date=close_date_obj,
+            )
+            result = await client(
+                functions.messages.SendMediaRequest(
+                    peer=entity,
+                    media=InputMediaPoll(poll=poll),
+                    message="",
+                    random_id=random.randint(0, 2**63 - 1),
+                )
+            )
+            return f"Poll created successfully in chat {chat_id}."
+        except Exception as retry_e:
+            return log_and_format_error(
+                "create_poll", retry_e, chat_id=chat_id, question=question, options=options
+            )
     except Exception as e:
         logger.exception(f"create_poll failed (chat_id={chat_id}, question='{question}')")
         return log_and_format_error(
@@ -3329,6 +3539,9 @@ async def send_reaction(
         big: Whether to show a big animation for the reaction (default: False)
     """
     try:
+        # Rate limiting protection (реакции тоже считаются действиями)
+        await _mcp_wait_for_rate_limit()
+
         from telethon.tl.types import ReactionEmoji
 
         peer = await client.get_input_entity(chat_id)
@@ -3341,6 +3554,25 @@ async def send_reaction(
             )
         )
         return f"Reaction '{emoji}' sent to message {message_id} in chat {chat_id}."
+    except TelethonFloodWaitError as e:
+        wait_time = min(float(e.seconds), 3600.0)
+        await asyncio.sleep(wait_time + random.uniform(0, 1))
+        try:
+            from telethon.tl.types import ReactionEmoji
+            peer = await client.get_input_entity(chat_id)
+            await client(
+                functions.messages.SendReactionRequest(
+                    peer=peer,
+                    msg_id=message_id,
+                    big=big,
+                    reaction=[ReactionEmoji(emoticon=emoji)],
+                )
+            )
+            return f"Reaction '{emoji}' sent to message {message_id} in chat {chat_id}."
+        except Exception as retry_e:
+            return log_and_format_error(
+                "send_reaction", retry_e, chat_id=chat_id, message_id=message_id, emoji=emoji
+            )
     except Exception as e:
         logger.exception(
             f"send_reaction failed (chat_id={chat_id}, message_id={message_id}, emoji={emoji})"
@@ -3368,6 +3600,9 @@ async def remove_reaction(
         message_id: The message ID to remove reaction from
     """
     try:
+        # Rate limiting protection (реакции тоже считаются действиями)
+        await _mcp_wait_for_rate_limit()
+
         peer = await client.get_input_entity(chat_id)
         await client(
             functions.messages.SendReactionRequest(
@@ -3377,6 +3612,21 @@ async def remove_reaction(
             )
         )
         return f"Reaction removed from message {message_id} in chat {chat_id}."
+    except TelethonFloodWaitError as e:
+        wait_time = min(float(e.seconds), 3600.0)
+        await asyncio.sleep(wait_time + random.uniform(0, 1))
+        try:
+            peer = await client.get_input_entity(chat_id)
+            await client(
+                functions.messages.SendReactionRequest(
+                    peer=peer,
+                    msg_id=message_id,
+                    reaction=[],  # Empty list removes reaction
+                )
+            )
+            return f"Reaction removed from message {message_id} in chat {chat_id}."
+        except Exception as retry_e:
+            return log_and_format_error("remove_reaction", retry_e, chat_id=chat_id, message_id=message_id)
     except Exception as e:
         logger.exception(f"remove_reaction failed (chat_id={chat_id}, message_id={message_id})")
         return log_and_format_error("remove_reaction", e, chat_id=chat_id, message_id=message_id)
