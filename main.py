@@ -136,6 +136,47 @@ async def _mcp_check_message_rate_limit(chat_id: Union[int, str]):
     
     _mcp_last_message_time_per_chat[chat_id] = time.time()
 
+async def _mcp_protected_read_operation(op, max_retries: int = 3):
+    """
+    Универсальная защита для операций чтения:
+    - Глобальный rate limit (0.2 сек между запросами)
+    - Обработка FloodWaitError с автоматическим повтором
+    - Exponential backoff при ошибках
+    
+    Args:
+        op: Coroutine object (awaitable) или callable, возвращающий awaitable
+        max_retries: Максимальное количество попыток (по умолчанию 3)
+    
+    Returns:
+        Результат выполнения coroutine
+    """
+    for attempt in range(max_retries):
+        await _mcp_wait_for_rate_limit()
+        try:
+            # Выполняем coroutine; если оп - callable, создаем новую корутину на каждую попытку
+            coro = op() if callable(op) else op
+            return await coro
+        except TelethonFloodWaitError as e:
+            wait_time = min(float(getattr(e, "seconds", 0)), 3600.0)
+            if wait_time > 0:
+                logger.warning(
+                    f"FloodWaitError: waiting {wait_time} seconds (attempt {attempt + 1}/{max_retries})"
+                )
+                await asyncio.sleep(wait_time + random.uniform(0, 0.5))
+                if attempt < max_retries - 1:
+                    continue
+            raise
+        except Exception as e:
+            # Для других ошибок делаем exponential backoff
+            if attempt < max_retries - 1:
+                backoff_time = (2 ** attempt) + random.uniform(0, 0.5)
+                logger.warning(f"Error in read operation (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {backoff_time:.2f}s")
+                await asyncio.sleep(backoff_time)
+                continue
+            raise
+
+    raise RuntimeError("All retry attempts exhausted")
+
 # Setup robust logging with both file and console output
 logger = logging.getLogger("telegram_mcp")
 logger.setLevel(logging.ERROR)  # Set to ERROR for production, INFO for debugging
@@ -407,7 +448,7 @@ async def get_chats(page: int = 1, page_size: int = 20) -> str:
         page_size: Number of chats per page.
     """
     try:
-        dialogs = await client.get_dialogs()
+        dialogs = await _mcp_protected_read_operation(lambda: client.get_dialogs())
         start = (page - 1) * page_size
         end = start + page_size
         if start >= len(dialogs):
@@ -435,9 +476,11 @@ async def get_messages(chat_id: Union[int, str], page: int = 1, page_size: int =
         page_size: Number of messages per page.
     """
     try:
-        entity = await client.get_entity(chat_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
         offset = (page - 1) * page_size
-        messages = await client.get_messages(entity, limit=page_size, add_offset=offset)
+        messages = await _mcp_protected_read_operation(
+            lambda: client.get_messages(entity, limit=page_size, add_offset=offset)
+        )
         if not messages:
             return "No messages found for this page."
         lines = []
@@ -475,14 +518,14 @@ async def send_message(chat_id: Union[int, str], message: str) -> str:
         await _mcp_check_message_rate_limit(chat_id)
         await _mcp_wait_for_rate_limit()
         
-        entity = await client.get_entity(chat_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
         await client.send_message(entity, message)
         return "Message sent successfully."
     except TelethonFloodWaitError as e:
         wait_time = min(float(e.seconds), 3600.0)
         await asyncio.sleep(wait_time + random.uniform(0, 1))
         try:
-            entity = await client.get_entity(chat_id)
+            entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
             await client.send_message(entity, message)
             return "Message sent successfully."
         except Exception as retry_e:
@@ -505,7 +548,7 @@ async def subscribe_public_channel(channel: Union[int, str]) -> str:
     Subscribe (join) to a public channel or supergroup by username or ID.
     """
     try:
-        entity = await client.get_entity(channel)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(channel))
         await client(functions.channels.JoinChannelRequest(channel=entity))
         title = getattr(entity, "title", getattr(entity, "username", "Unknown channel"))
         return f"Subscribed to {title}."
@@ -535,15 +578,15 @@ async def list_inline_buttons(
             else:
                 return "message_id must be an integer."
 
-        entity = await client.get_entity(chat_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
         target_message = None
 
         if message_id is not None:
-            target_message = await client.get_messages(entity, ids=message_id)
+            target_message = await _mcp_protected_read_operation(lambda: client.get_messages(entity, ids=message_id))
             if isinstance(target_message, list):
                 target_message = target_message[0] if target_message else None
         else:
-            recent_messages = await client.get_messages(entity, limit=limit)
+            recent_messages = await _mcp_protected_read_operation(lambda: client.get_messages(entity, limit=limit))
             target_message = next(
                 (msg for msg in recent_messages if getattr(msg, "buttons", None)), None
             )
@@ -622,15 +665,15 @@ async def press_inline_button(
             else:
                 return "button_index must be an integer."
 
-        entity = await client.get_entity(chat_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
 
         target_message = None
         if message_id is not None:
-            target_message = await client.get_messages(entity, ids=message_id)
+            target_message = await _mcp_protected_read_operation(lambda: client.get_messages(entity, ids=message_id))
             if isinstance(target_message, list):
                 target_message = target_message[0] if target_message else None
         else:
-            recent_messages = await client.get_messages(entity, limit=20)
+            recent_messages = await _mcp_protected_read_operation(lambda: client.get_messages(entity, limit=20))
             target_message = next(
                 (msg for msg in recent_messages if getattr(msg, "buttons", None)), None
             )
@@ -711,7 +754,9 @@ async def list_contacts() -> str:
     List all contacts in your Telegram account.
     """
     try:
-        result = await client(functions.contacts.GetContactsRequest(hash=0))
+        result = await _mcp_protected_read_operation(
+            lambda: client(functions.contacts.GetContactsRequest(hash=0))
+        )
         users = result.users
         if not users:
             return "No contacts found."
@@ -741,7 +786,9 @@ async def search_contacts(query: str) -> str:
         query: The search term to look for in contact names, usernames, or phone numbers.
     """
     try:
-        result = await client(functions.contacts.SearchRequest(q=query, limit=50))
+        result = await _mcp_protected_read_operation(
+            lambda: client(functions.contacts.SearchRequest(q=query, limit=50))
+        )
         users = result.users
         if not users:
             return f"No contacts found matching '{query}'."
@@ -769,7 +816,9 @@ async def get_contact_ids() -> str:
     Get all contact IDs in your Telegram account.
     """
     try:
-        result = await client(functions.contacts.GetContactIDsRequest(hash=0))
+        result = await _mcp_protected_read_operation(
+            lambda: client(functions.contacts.GetContactIDsRequest(hash=0))
+        )
         if not result:
             return "No contact IDs found."
         return "Contact IDs: " + ", ".join(str(cid) for cid in result)
@@ -799,7 +848,7 @@ async def list_messages(
         to_date: Filter messages until this date (format: YYYY-MM-DD).
     """
     try:
-        entity = await client.get_entity(chat_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
 
         # Parse date filters if provided
         from_date_obj = None
@@ -843,6 +892,8 @@ async def list_messages(
             # Use server-side search alone, then enforce date bounds client-side.
             params["search"] = search_query
             messages = []
+            # iter_messages уже делает запросы с задержками внутри, но добавим защиту на первый запрос
+            await _mcp_wait_for_rate_limit()
             async for msg in client.iter_messages(entity, **params):  # newest -> oldest
                 if to_date_obj and msg.date > to_date_obj:
                     continue
@@ -880,7 +931,9 @@ async def list_messages(
                         if len(messages) >= limit:
                             break
             else:
-                messages = await client.get_messages(entity, limit=limit, **params)
+                messages = await _mcp_protected_read_operation(
+                    lambda: client.get_messages(entity, limit=limit, **params)
+                )
 
         if not messages:
             return "No messages found matching the criteria."
@@ -924,7 +977,7 @@ async def list_topics(
         search_query: Optional query to filter topics by title.
     """
     try:
-        entity = await client.get_entity(chat_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
 
         if not isinstance(entity, Channel) or not getattr(entity, "megagroup", False):
             return "The specified chat is not a supergroup."
@@ -932,14 +985,16 @@ async def list_topics(
         if not getattr(entity, "forum", False):
             return "The specified supergroup does not have forum topics enabled."
 
-        result = await client(
-            functions.channels.GetForumTopicsRequest(
-                channel=entity,
-                offset_date=0,
-                offset_id=0,
-                offset_topic=offset_topic,
-                limit=limit,
-                q=search_query or None,
+        result = await _mcp_protected_read_operation(
+            lambda: client(
+                functions.channels.GetForumTopicsRequest(
+                    channel=entity,
+                    offset_date=0,
+                    offset_id=0,
+                    offset_topic=offset_topic,
+                    limit=limit,
+                    q=search_query or None,
+                )
             )
         )
 
@@ -1001,7 +1056,7 @@ async def list_chats(chat_type: str = None, limit: int = 20) -> str:
         limit: Maximum number of chats to retrieve.
     """
     try:
-        dialogs = await client.get_dialogs(limit=limit)
+        dialogs = await _mcp_protected_read_operation(lambda: client.get_dialogs(limit=limit))
 
         results = []
         for dialog in dialogs:
@@ -1073,7 +1128,7 @@ async def get_chat(chat_id: Union[int, str]) -> str:
         chat_id: The ID or username of the chat.
     """
     try:
-        entity = await client.get_entity(chat_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
 
         result = []
         result.append(f"ID: {entity.id}")
@@ -1097,7 +1152,7 @@ async def get_chat(chat_id: Union[int, str]) -> str:
 
             # Fetch participants count reliably
             try:
-                participants_count = (await client.get_participants(entity, limit=0)).total
+                participants_count = (await _mcp_protected_read_operation(lambda: client.get_participants(entity, limit=0))).total
                 result.append(f"Participants: {participants_count}")
             except Exception as pe:
                 result.append(f"Participants: Error fetching ({pe})")
@@ -1119,7 +1174,7 @@ async def get_chat(chat_id: Union[int, str]) -> str:
         try:
             # Using get_dialogs might be slow if there are many dialogs
             # Alternative: Get entity again via get_dialogs if needed for unread count
-            dialog = await client.get_dialogs(limit=1, offset_id=0, offset_peer=entity)
+            dialog = await _mcp_protected_read_operation(lambda: client.get_dialogs(limit=1, offset_id=0, offset_peer=entity))
             if dialog:
                 dialog = dialog[0]
                 result.append(f"Unread Messages: {dialog.unread_count}")
@@ -1158,7 +1213,9 @@ async def get_direct_chat_by_contact(contact_query: str) -> str:
     """
     try:
         # Fetch all contacts using the correct Telethon method
-        result = await client(functions.contacts.GetContactsRequest(hash=0))
+        result = await _mcp_protected_read_operation(
+            lambda: client(functions.contacts.GetContactsRequest(hash=0))
+        )
         contacts = result.users
         found_contacts = []
         for contact in contacts:
@@ -1179,7 +1236,7 @@ async def get_direct_chat_by_contact(contact_query: str) -> str:
             return f"No contacts found matching '{contact_query}'."
         # If we found contacts, look for direct chats with them
         results = []
-        dialogs = await client.get_dialogs()
+        dialogs = await _mcp_protected_read_operation(lambda: client.get_dialogs())
         for contact in found_contacts:
             contact_name = (
                 f"{getattr(contact, 'first_name', '')} {getattr(contact, 'last_name', '')}".strip()
@@ -1216,7 +1273,7 @@ async def get_contact_chats(contact_id: Union[int, str]) -> str:
     """
     try:
         # Get contact info
-        contact = await client.get_entity(contact_id)
+        contact = await _mcp_protected_read_operation(lambda: client.get_entity(contact_id))
         if not isinstance(contact, User):
             return f"ID {contact_id} is not a user/contact."
 
@@ -1226,7 +1283,7 @@ async def get_contact_chats(contact_id: Union[int, str]) -> str:
 
         # Find direct chat
         direct_chat = None
-        dialogs = await client.get_dialogs()
+        dialogs = await _mcp_protected_read_operation(lambda: client.get_dialogs())
 
         results = []
 
@@ -1273,7 +1330,7 @@ async def get_last_interaction(contact_id: Union[int, str]) -> str:
     """
     try:
         # Get contact info
-        contact = await client.get_entity(contact_id)
+        contact = await _mcp_protected_read_operation(lambda: client.get_entity(contact_id))
         if not isinstance(contact, User):
             return f"ID {contact_id} is not a user/contact."
 
@@ -1282,7 +1339,7 @@ async def get_last_interaction(contact_id: Union[int, str]) -> str:
         )
 
         # Get the last few messages
-        messages = await client.get_messages(contact, limit=5)
+        messages = await _mcp_protected_read_operation(lambda: client.get_messages(contact, limit=5))
 
         if not messages:
             return f"No messages found with {contact_name} (ID: {contact_id})."
@@ -1315,17 +1372,21 @@ async def get_message_context(
         context_size: Number of messages before and after to include.
     """
     try:
-        chat = await client.get_entity(chat_id)
+        chat = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
         # Get messages around the specified message
-        messages_before = await client.get_messages(chat, limit=context_size, max_id=message_id)
-        central_message = await client.get_messages(chat, ids=message_id)
+        messages_before = await _mcp_protected_read_operation(
+            lambda: client.get_messages(chat, limit=context_size, max_id=message_id)
+        )
+        central_message = await _mcp_protected_read_operation(
+            lambda: client.get_messages(chat, ids=message_id)
+        )
         # Fix: get_messages(ids=...) returns a single Message, not a list
         if central_message is not None and not isinstance(central_message, list):
             central_message = [central_message]
         elif central_message is None:
             central_message = []
-        messages_after = await client.get_messages(
-            chat, limit=context_size, min_id=message_id, reverse=True
+        messages_after = await _mcp_protected_read_operation(
+            lambda: client.get_messages(chat, limit=context_size, min_id=message_id, reverse=True)
         )
         if not central_message:
             return f"Message with ID {message_id} not found in chat {chat_id}."
@@ -1341,7 +1402,9 @@ async def get_message_context(
             reply_content = ""
             if msg.reply_to and msg.reply_to.reply_to_msg_id:
                 try:
-                    replied_msg = await client.get_messages(chat, ids=msg.reply_to.reply_to_msg_id)
+                    replied_msg = await _mcp_protected_read_operation(
+                        lambda: client.get_messages(chat, ids=msg.reply_to.reply_to_msg_id)
+                    )
                     if replied_msg:
                         replied_sender = "Unknown"
                         if replied_msg.sender:
@@ -1441,7 +1504,7 @@ async def delete_contact(user_id: Union[int, str]) -> str:
         user_id: The Telegram user ID or username of the contact to delete.
     """
     try:
-        user = await client.get_entity(user_id)
+        user = await _mcp_protected_read_operation(lambda: client.get_entity(user_id))
         await client(functions.contacts.DeleteContactsRequest(id=[user]))
         return f"Contact with user ID {user_id} deleted."
     except Exception as e:
@@ -1461,7 +1524,8 @@ async def block_user(user_id: Union[int, str]) -> str:
         user_id: The Telegram user ID or username to block.
     """
     try:
-        user = await client.get_entity(user_id)
+        user = await _mcp_protected_read_operation(lambda: client.get_entity(user_id))
+        await _mcp_wait_for_rate_limit()
         await client(functions.contacts.BlockRequest(id=user))
         return f"User {user_id} blocked."
     except Exception as e:
@@ -1481,7 +1545,8 @@ async def unblock_user(user_id: Union[int, str]) -> str:
         user_id: The Telegram user ID or username to unblock.
     """
     try:
-        user = await client.get_entity(user_id)
+        user = await _mcp_protected_read_operation(lambda: client.get_entity(user_id))
+        await _mcp_wait_for_rate_limit()
         await client(functions.contacts.UnblockRequest(id=user))
         return f"User {user_id} unblocked."
     except Exception as e:
@@ -1494,7 +1559,7 @@ async def get_me() -> str:
     Get your own user information.
     """
     try:
-        me = await client.get_me()
+        me = await _mcp_protected_read_operation(lambda: client.get_me())
         return json.dumps(format_entity(me), indent=2)
     except Exception as e:
         return log_and_format_error("get_me", e)
@@ -1517,7 +1582,7 @@ async def create_group(title: str, user_ids: List[Union[int, str]]) -> str:
         users = []
         for user_id in user_ids:
             try:
-                user = await client.get_entity(user_id)
+                user = await _mcp_protected_read_operation(lambda: client.get_entity(user_id))
                 users.append(user)
             except Exception as e:
                 logger.error(f"Failed to get entity for user ID {user_id}: {e}")
@@ -1543,7 +1608,7 @@ async def create_group(title: str, user_ids: List[Union[int, str]]) -> str:
                 # If we can't determine the chat ID directly from the result
                 # Try to find it in recent dialogs
                 await asyncio.sleep(1)  # Give Telegram a moment to register the new group
-                dialogs = await client.get_dialogs(limit=5)  # Get recent dialogs
+                dialogs = await _mcp_protected_read_operation(lambda: client.get_dialogs(limit=5))  # Get recent dialogs
                 for dialog in dialogs:
                     if dialog.title == title:
                         return f"Group created with ID: {dialog.id}"
@@ -1576,12 +1641,12 @@ async def invite_to_group(group_id: Union[int, str], user_ids: List[Union[int, s
         user_ids: List of user IDs or usernames to invite.
     """
     try:
-        entity = await client.get_entity(group_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(group_id))
         users_to_add = []
 
         for user_id in user_ids:
             try:
-                user = await client.get_entity(user_id)
+                user = await _mcp_protected_read_operation(lambda: client.get_entity(user_id))
                 users_to_add.append(user)
             except ValueError as e:
                 return f"Error: User with ID {user_id} could not be found. {e}"
@@ -1629,12 +1694,13 @@ async def leave_chat(chat_id: Union[int, str]) -> str:
         chat_id: The chat ID or username to leave.
     """
     try:
-        entity = await client.get_entity(chat_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
 
         # Check the entity type carefully
         if isinstance(entity, Channel):
             # Handle both channels and supergroups (which are also channels in Telegram)
             try:
+                await _mcp_wait_for_rate_limit()
                 await client(functions.channels.LeaveChannelRequest(channel=entity))
                 chat_name = getattr(entity, "title", str(chat_id))
                 return f"Left channel/supergroup {chat_name} (ID: {chat_id})."
@@ -1645,7 +1711,7 @@ async def leave_chat(chat_id: Union[int, str]) -> str:
             # Traditional basic groups (not supergroups)
             try:
                 # First try with InputPeerUser
-                me = await client.get_me(input_peer=True)
+                me = await _mcp_protected_read_operation(lambda: client.get_me(input_peer=True))
                 await client(
                     functions.messages.DeleteChatUserRequest(
                         chat_id=entity.id,
@@ -1662,7 +1728,7 @@ async def leave_chat(chat_id: Union[int, str]) -> str:
 
                 try:
                     # Alternative approach - sometimes this works better
-                    me_full = await client.get_me()
+                    me_full = await _mcp_protected_read_operation(lambda: client.get_me())
                     await client(
                         functions.messages.DeleteChatUserRequest(
                             chat_id=entity.id, user_id=me_full.id
@@ -1711,7 +1777,8 @@ async def get_participants(chat_id: Union[int, str]) -> str:
         chat_id: The group or channel ID or username.
     """
     try:
-        participants = await client.get_participants(chat_id)
+        await _mcp_wait_for_rate_limit()
+        participants = await _mcp_protected_read_operation(lambda: client.get_participants(chat_id))
         lines = [
             f"ID: {p.id}, Name: {getattr(p, 'first_name', '')} {getattr(p, 'last_name', '')}"
             for p in participants
@@ -1741,14 +1808,14 @@ async def send_file(chat_id: Union[int, str], file_path: str, caption: str = Non
         await _mcp_check_message_rate_limit(chat_id)
         await _mcp_wait_for_rate_limit()
 
-        entity = await client.get_entity(chat_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
         await client.send_file(entity, file_path, caption=caption)
         return f"File sent to chat {chat_id}."
     except TelethonFloodWaitError as e:
         wait_time = min(float(e.seconds), 3600.0)
         await asyncio.sleep(wait_time + random.uniform(0, 1))
         try:
-            entity = await client.get_entity(chat_id)
+            entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
             await client.send_file(entity, file_path, caption=caption)
             return f"File sent to chat {chat_id}."
         except Exception as retry_e:
@@ -1774,15 +1841,15 @@ async def download_media(chat_id: Union[int, str], message_id: int, file_path: s
         file_path: Absolute path to save the downloaded file (must be writable).
     """
     try:
-        entity = await client.get_entity(chat_id)
-        msg = await client.get_messages(entity, ids=message_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
+        msg = await _mcp_protected_read_operation(lambda: client.get_messages(entity, ids=message_id))
         if not msg or not msg.media:
             return "No media found in the specified message."
         # Check if directory is writable
         dir_path = os.path.dirname(file_path) or "."
         if not os.access(dir_path, os.W_OK):
             return f"Directory not writable: {dir_path}"
-        await client.download_media(msg, file=file_path)
+        await _mcp_protected_read_operation(lambda: client.download_media(msg, file=file_path))
         if not os.path.isfile(file_path):
             return f"Download failed: file not created at {file_path}"
         return f"Media downloaded to {file_path}."
@@ -1871,8 +1938,10 @@ async def get_privacy_settings() -> str:
         from telethon.tl.types import InputPrivacyKeyStatusTimestamp
 
         try:
-            settings = await client(
-                functions.account.GetPrivacyRequest(key=InputPrivacyKeyStatusTimestamp())
+            settings = await _mcp_protected_read_operation(
+                lambda: client(
+                    functions.account.GetPrivacyRequest(key=InputPrivacyKeyStatusTimestamp())
+                )
             )
             return str(settings)
         except TypeError as e:
@@ -1942,7 +2011,7 @@ async def set_privacy_settings(
                 allow_entities = []
                 for user_id in allow_users:
                     try:
-                        user = await client.get_entity(user_id)
+                        user = await _mcp_protected_read_operation(lambda: client.get_entity(user_id))
                         allow_entities.append(user)
                     except Exception as user_err:
                         logger.warning(f"Could not get entity for user ID {user_id}: {user_err}")
@@ -1959,7 +2028,7 @@ async def set_privacy_settings(
                 disallow_entities = []
                 for user_id in disallow_users:
                     try:
-                        user = await client.get_entity(user_id)
+                        user = await _mcp_protected_read_operation(lambda: client.get_entity(user_id))
                         disallow_entities.append(user)
                     except Exception as user_err:
                         logger.warning(f"Could not get entity for user ID {user_id}: {user_err}")
@@ -2017,7 +2086,9 @@ async def export_contacts() -> str:
     Export all contacts as a JSON string.
     """
     try:
-        result = await client(functions.contacts.GetContactsRequest(hash=0))
+        result = await _mcp_protected_read_operation(
+            lambda: client(functions.contacts.GetContactsRequest(hash=0))
+        )
         users = result.users
         return json.dumps([format_entity(u) for u in users], indent=2)
     except Exception as e:
@@ -2032,7 +2103,9 @@ async def get_blocked_users() -> str:
     Get a list of blocked users.
     """
     try:
-        result = await client(functions.contacts.GetBlockedRequest(offset=0, limit=100))
+        result = await _mcp_protected_read_operation(
+            lambda: client(functions.contacts.GetBlockedRequest(offset=0, limit=100))
+        )
         return json.dumps([format_entity(u) for u in result.users], indent=2)
     except Exception as e:
         return log_and_format_error("get_blocked_users", e)
@@ -2067,7 +2140,8 @@ async def edit_chat_title(chat_id: Union[int, str], title: str) -> str:
     Edit the title of a chat, group, or channel.
     """
     try:
-        entity = await client.get_entity(chat_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
+        await _mcp_wait_for_rate_limit()
         if isinstance(entity, Channel):
             await client(functions.channels.EditTitleRequest(channel=entity, title=title))
         elif isinstance(entity, Chat):
@@ -2096,7 +2170,8 @@ async def edit_chat_photo(chat_id: Union[int, str], file_path: str) -> str:
         if not os.access(file_path, os.R_OK):
             return f"Photo file not readable: {file_path}"
 
-        entity = await client.get_entity(chat_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
+        await _mcp_wait_for_rate_limit()
         uploaded_file = await client.upload_file(file_path)
 
         if isinstance(entity, Channel):
@@ -2129,7 +2204,8 @@ async def delete_chat_photo(chat_id: Union[int, str]) -> str:
     Delete the photo of a chat, group, or channel.
     """
     try:
-        entity = await client.get_entity(chat_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
+        await _mcp_wait_for_rate_limit()
         if isinstance(entity, Channel):
             # Use InputChatPhotoEmpty for channels/supergroups
             await client(
@@ -2169,8 +2245,8 @@ async def promote_admin(
         rights: Admin rights to give (optional)
     """
     try:
-        chat = await client.get_entity(group_id)
-        user = await client.get_entity(user_id)
+        chat = await _mcp_protected_read_operation(lambda: client.get_entity(group_id))
+        user = await _mcp_protected_read_operation(lambda: client.get_entity(user_id))
 
         # Set default admin rights if not provided
         if not rights:
@@ -2237,8 +2313,8 @@ async def demote_admin(group_id: Union[int, str], user_id: Union[int, str]) -> s
         user_id: User ID or username to demote
     """
     try:
-        chat = await client.get_entity(group_id)
-        user = await client.get_entity(user_id)
+        chat = await _mcp_protected_read_operation(lambda: client.get_entity(group_id))
+        user = await _mcp_protected_read_operation(lambda: client.get_entity(user_id))
 
         # Create empty admin rights (regular user)
         admin_rights = ChatAdminRights(
@@ -2290,8 +2366,8 @@ async def ban_user(chat_id: Union[int, str], user_id: Union[int, str]) -> str:
         user_id: User ID or username to ban
     """
     try:
-        chat = await client.get_entity(chat_id)
-        user = await client.get_entity(user_id)
+        chat = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
+        user = await _mcp_protected_read_operation(lambda: client.get_entity(user_id))
 
         # Create banned rights (all restrictions enabled)
         banned_rights = ChatBannedRights(
@@ -2341,8 +2417,8 @@ async def unban_user(chat_id: Union[int, str], user_id: Union[int, str]) -> str:
         user_id: User ID or username to unban
     """
     try:
-        chat = await client.get_entity(chat_id)
-        user = await client.get_entity(user_id)
+        chat = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
+        user = await _mcp_protected_read_operation(lambda: client.get_entity(user_id))
 
         # Create unbanned rights (no restrictions)
         unbanned_rights = ChatBannedRights(
@@ -2385,7 +2461,7 @@ async def get_admins(chat_id: Union[int, str]) -> str:
     """
     try:
         # Fix: Use the correct filter type ChannelParticipantsAdmins
-        participants = await client.get_participants(chat_id, filter=ChannelParticipantsAdmins())
+        participants = await _mcp_protected_read_operation(lambda: client.get_participants(chat_id, filter=ChannelParticipantsAdmins()))
         lines = [
             f"ID: {p.id}, Name: {getattr(p, 'first_name', '')} {getattr(p, 'last_name', '')}".strip()
             for p in participants
@@ -2406,8 +2482,8 @@ async def get_banned_users(chat_id: Union[int, str]) -> str:
     """
     try:
         # Fix: Use the correct filter type ChannelParticipantsKicked
-        participants = await client.get_participants(
-            chat_id, filter=ChannelParticipantsKicked(q="")
+        participants = await _mcp_protected_read_operation(
+            lambda: client.get_participants(chat_id, filter=ChannelParticipantsKicked(q=""))
         )
         lines = [
             f"ID: {p.id}, Name: {getattr(p, 'first_name', '')} {getattr(p, 'last_name', '')}".strip()
@@ -2428,13 +2504,15 @@ async def get_invite_link(chat_id: Union[int, str]) -> str:
     Get the invite link for a group or channel.
     """
     try:
-        entity = await client.get_entity(chat_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
 
         # Try using ExportChatInviteRequest first
         try:
             from telethon.tl import functions
 
-            result = await client(functions.messages.ExportChatInviteRequest(peer=entity))
+            result = await _mcp_protected_read_operation(
+                lambda: client(functions.messages.ExportChatInviteRequest(peer=entity))
+            )
             return result.link
         except AttributeError:
             # If the function doesn't exist in the current Telethon version
@@ -2445,7 +2523,9 @@ async def get_invite_link(chat_id: Union[int, str]) -> str:
 
         # Alternative approach using client.export_chat_invite_link
         try:
-            invite_link = await client.export_chat_invite_link(entity)
+            invite_link = await _mcp_protected_read_operation(
+                lambda: client.export_chat_invite_link(entity)
+            )
             return invite_link
         except Exception as e2:
             logger.warning(f"export_chat_invite_link failed: {e2}")
@@ -2453,7 +2533,9 @@ async def get_invite_link(chat_id: Union[int, str]) -> str:
         # Last resort: Try directly fetching chat info
         try:
             if isinstance(entity, (Chat, Channel)):
-                full_chat = await client(functions.messages.GetFullChatRequest(chat_id=entity.id))
+                full_chat = await _mcp_protected_read_operation(
+                    lambda: client(functions.messages.GetFullChatRequest(chat_id=entity.id))
+                )
                 if hasattr(full_chat, "full_chat") and hasattr(full_chat.full_chat, "invite_link"):
                     return full_chat.full_chat.invite_link or "No invite link available."
         except Exception as e3:
@@ -2522,13 +2604,15 @@ async def export_chat_invite(chat_id: Union[int, str]) -> str:
     Export a chat invite link.
     """
     try:
-        entity = await client.get_entity(chat_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
 
         # Try using ExportChatInviteRequest first
         try:
             from telethon.tl import functions
 
-            result = await client(functions.messages.ExportChatInviteRequest(peer=entity))
+            result = await _mcp_protected_read_operation(
+                lambda: client(functions.messages.ExportChatInviteRequest(peer=entity))
+            )
             return result.link
         except AttributeError:
             # If the function doesn't exist in the current Telethon version
@@ -2539,7 +2623,9 @@ async def export_chat_invite(chat_id: Union[int, str]) -> str:
 
         # Alternative approach using client.export_chat_invite_link
         try:
-            invite_link = await client.export_chat_invite_link(entity)
+            invite_link = await _mcp_protected_read_operation(
+                lambda: client.export_chat_invite_link(entity)
+            )
             return invite_link
         except Exception as e2:
             logger.warning(f"export_chat_invite_link failed: {e2}")
@@ -2644,14 +2730,14 @@ async def send_voice(chat_id: Union[int, str], file_path: str) -> str:
         await _mcp_check_message_rate_limit(chat_id)
         await _mcp_wait_for_rate_limit()
 
-        entity = await client.get_entity(chat_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
         await client.send_file(entity, file_path, voice_note=True)
         return f"Voice message sent to chat {chat_id}."
     except TelethonFloodWaitError as e:
         wait_time = min(float(e.seconds), 3600.0)
         await asyncio.sleep(wait_time + random.uniform(0, 1))
         try:
-            entity = await client.get_entity(chat_id)
+            entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
             await client.send_file(entity, file_path, voice_note=True)
             return f"Voice message sent to chat {chat_id}."
         except Exception as retry_e:
@@ -2675,16 +2761,16 @@ async def forward_message(
         await _mcp_check_message_rate_limit(to_chat_id)
         await _mcp_wait_for_rate_limit()
         
-        from_entity = await client.get_entity(from_chat_id)
-        to_entity = await client.get_entity(to_chat_id)
+        from_entity = await _mcp_protected_read_operation(lambda: client.get_entity(from_chat_id))
+        to_entity = await _mcp_protected_read_operation(lambda: client.get_entity(to_chat_id))
         await client.forward_messages(to_entity, message_id, from_entity)
         return f"Message {message_id} forwarded from {from_chat_id} to {to_chat_id}."
     except TelethonFloodWaitError as e:
         wait_time = min(float(e.seconds), 3600.0)
         await asyncio.sleep(wait_time + random.uniform(0, 1))
         try:
-            from_entity = await client.get_entity(from_chat_id)
-            to_entity = await client.get_entity(to_chat_id)
+            from_entity = await _mcp_protected_read_operation(lambda: client.get_entity(from_chat_id))
+            to_entity = await _mcp_protected_read_operation(lambda: client.get_entity(to_chat_id))
             await client.forward_messages(to_entity, message_id, from_entity)
             return f"Message {message_id} forwarded from {from_chat_id} to {to_chat_id}."
         except Exception as retry_e:
@@ -2712,14 +2798,14 @@ async def edit_message(chat_id: Union[int, str], message_id: int, new_text: str)
         await _mcp_check_edit_rate_limit()
         await _mcp_wait_for_rate_limit()
         
-        entity = await client.get_entity(chat_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
         await client.edit_message(entity, message_id, new_text)
         return f"Message {message_id} edited."
     except TelethonFloodWaitError as e:
         wait_time = min(float(e.seconds), 3600.0)
         await asyncio.sleep(wait_time + random.uniform(0, 1))
         try:
-            entity = await client.get_entity(chat_id)
+            entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
             await client.edit_message(entity, message_id, new_text)
             return f"Message {message_id} edited."
         except Exception as retry_e:
@@ -2743,7 +2829,7 @@ async def delete_message(chat_id: Union[int, str], message_id: int) -> str:
     Delete a message by ID.
     """
     try:
-        entity = await client.get_entity(chat_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
         await client.delete_messages(entity, message_id)
         return f"Message {message_id} deleted."
     except Exception as e:
@@ -2761,7 +2847,7 @@ async def pin_message(chat_id: Union[int, str], message_id: int) -> str:
     Pin a message in a chat.
     """
     try:
-        entity = await client.get_entity(chat_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
         await client.pin_message(entity, message_id)
         return f"Message {message_id} pinned in chat {chat_id}."
     except Exception as e:
@@ -2779,7 +2865,7 @@ async def unpin_message(chat_id: Union[int, str], message_id: int) -> str:
     Unpin a message in a chat.
     """
     try:
-        entity = await client.get_entity(chat_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
         await client.unpin_message(entity, message_id)
         return f"Message {message_id} unpinned in chat {chat_id}."
     except Exception as e:
@@ -2797,7 +2883,7 @@ async def mark_as_read(chat_id: Union[int, str]) -> str:
     Mark all messages as read in a chat.
     """
     try:
-        entity = await client.get_entity(chat_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
         await client.send_read_acknowledge(entity)
         return f"Marked all messages as read in chat {chat_id}."
     except Exception as e:
@@ -2817,14 +2903,14 @@ async def reply_to_message(chat_id: Union[int, str], message_id: int, text: str)
         await _mcp_check_message_rate_limit(chat_id)
         await _mcp_wait_for_rate_limit()
         
-        entity = await client.get_entity(chat_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
         await client.send_message(entity, text, reply_to=message_id)
         return f"Replied to message {message_id} in chat {chat_id}."
     except TelethonFloodWaitError as e:
         wait_time = min(float(e.seconds), 3600.0)
         await asyncio.sleep(wait_time + random.uniform(0, 1))
         try:
-            entity = await client.get_entity(chat_id)
+            entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
             await client.send_message(entity, text, reply_to=message_id)
             return f"Replied to message {message_id} in chat {chat_id}."
         except Exception as retry_e:
@@ -2850,8 +2936,8 @@ async def get_media_info(chat_id: Union[int, str], message_id: int) -> str:
         message_id: The message ID.
     """
     try:
-        entity = await client.get_entity(chat_id)
-        msg = await client.get_messages(entity, ids=message_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
+        msg = await _mcp_protected_read_operation(lambda: client.get_messages(entity, ids=message_id))
 
         if not msg or not msg.media:
             return "No media found in the specified message."
@@ -2869,7 +2955,9 @@ async def search_public_chats(query: str) -> str:
     Search for public chats, channels, or bots by username or title.
     """
     try:
-        result = await client(functions.contacts.SearchRequest(q=query, limit=20))
+        result = await _mcp_protected_read_operation(
+            lambda: client(functions.contacts.SearchRequest(q=query, limit=20))
+        )
         return json.dumps([format_entity(u) for u in result.users], indent=2)
     except Exception as e:
         return log_and_format_error("search_public_chats", e, query=query)
@@ -2884,8 +2972,10 @@ async def search_messages(chat_id: Union[int, str], query: str, limit: int = 20)
     Search for messages in a chat by text.
     """
     try:
-        entity = await client.get_entity(chat_id)
-        messages = await client.get_messages(entity, limit=limit, search=query)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
+        messages = await _mcp_protected_read_operation(
+            lambda: client.get_messages(entity, limit=limit, search=query)
+        )
 
         lines = []
         for msg in messages:
@@ -2911,7 +3001,9 @@ async def resolve_username(username: str) -> str:
     Resolve a username to a user or chat ID.
     """
     try:
-        result = await client(functions.contacts.ResolveUsernameRequest(username=username))
+        result = await _mcp_protected_read_operation(
+            lambda: client(functions.contacts.ResolveUsernameRequest(username=username))
+        )
         return str(result)
     except Exception as e:
         return log_and_format_error("resolve_username", e, username=username)
@@ -2930,7 +3022,7 @@ async def mute_chat(chat_id: Union[int, str]) -> str:
     try:
         from telethon.tl.types import InputPeerNotifySettings
 
-        peer = await client.get_entity(chat_id)
+        peer = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
         await client(
             functions.account.UpdateNotifySettingsRequest(
                 peer=peer, settings=InputPeerNotifySettings(mute_until=2**31 - 1)
@@ -2973,7 +3065,7 @@ async def unmute_chat(chat_id: Union[int, str]) -> str:
     try:
         from telethon.tl.types import InputPeerNotifySettings
 
-        peer = await client.get_entity(chat_id)
+        peer = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
         await client(
             functions.account.UpdateNotifySettingsRequest(
                 peer=peer, settings=InputPeerNotifySettings(mute_until=0)
@@ -3016,7 +3108,7 @@ async def archive_chat(chat_id: Union[int, str]) -> str:
     try:
         await client(
             functions.messages.ToggleDialogPinRequest(
-                peer=await client.get_entity(chat_id), pinned=True
+                peer=await _mcp_protected_read_operation(lambda: client.get_entity(chat_id)), pinned=True
             )
         )
         return f"Chat {chat_id} archived."
@@ -3037,7 +3129,7 @@ async def unarchive_chat(chat_id: Union[int, str]) -> str:
     try:
         await client(
             functions.messages.ToggleDialogPinRequest(
-                peer=await client.get_entity(chat_id), pinned=False
+                peer=await _mcp_protected_read_operation(lambda: client.get_entity(chat_id)), pinned=False
             )
         )
         return f"Chat {chat_id} unarchived."
@@ -3053,7 +3145,9 @@ async def get_sticker_sets() -> str:
     Get all sticker sets.
     """
     try:
-        result = await client(functions.messages.GetAllStickersRequest(hash=0))
+        result = await _mcp_protected_read_operation(
+            lambda: client(functions.messages.GetAllStickersRequest(hash=0))
+        )
         return json.dumps([s.title for s in result.sets], indent=2)
     except Exception as e:
         return log_and_format_error("get_sticker_sets", e)
@@ -3083,14 +3177,14 @@ async def send_sticker(chat_id: Union[int, str], file_path: str) -> str:
         await _mcp_check_message_rate_limit(chat_id)
         await _mcp_wait_for_rate_limit()
 
-        entity = await client.get_entity(chat_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
         await client.send_file(entity, file_path, force_document=False)
         return f"Sticker sent to chat {chat_id}."
     except TelethonFloodWaitError as e:
         wait_time = min(float(e.seconds), 3600.0)
         await asyncio.sleep(wait_time + random.uniform(0, 1))
         try:
-            entity = await client.get_entity(chat_id)
+            entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
             await client.send_file(entity, file_path, force_document=False)
             return f"Sticker sent to chat {chat_id}."
         except Exception as retry_e:
@@ -3113,8 +3207,10 @@ async def get_gif_search(query: str, limit: int = 10) -> str:
     try:
         # Try approach 1: SearchGifsRequest
         try:
-            result = await client(
-                functions.messages.SearchGifsRequest(q=query, offset_id=0, limit=limit)
+            result = await _mcp_protected_read_operation(
+                lambda: client(
+                    functions.messages.SearchGifsRequest(q=query, offset_id=0, limit=limit)
+                )
             )
             if not result.gifs:
                 return "[]"
@@ -3126,19 +3222,21 @@ async def get_gif_search(query: str, limit: int = 10) -> str:
             try:
                 from telethon.tl.types import InputMessagesFilterGif
 
-                result = await client(
-                    functions.messages.SearchRequest(
-                        peer="gif",
-                        q=query,
-                        filter=InputMessagesFilterGif(),
-                        min_date=None,
-                        max_date=None,
-                        offset_id=0,
-                        add_offset=0,
-                        limit=limit,
-                        max_id=0,
-                        min_id=0,
-                        hash=0,
+                result = await _mcp_protected_read_operation(
+                    lambda: client(
+                        functions.messages.SearchRequest(
+                            peer="gif",
+                            q=query,
+                            filter=InputMessagesFilterGif(),
+                            min_date=None,
+                            max_date=None,
+                            offset_id=0,
+                            add_offset=0,
+                            limit=limit,
+                            max_id=0,
+                            min_id=0,
+                            hash=0,
+                        )
                     )
                 )
                 if not result or not hasattr(result, "messages") or not result.messages:
@@ -3175,14 +3273,14 @@ async def send_gif(chat_id: Union[int, str], gif_id: int) -> str:
         await _mcp_check_message_rate_limit(chat_id)
         await _mcp_wait_for_rate_limit()
 
-        entity = await client.get_entity(chat_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
         await client.send_file(entity, gif_id)
         return f"GIF sent to chat {chat_id}."
     except TelethonFloodWaitError as e:
         wait_time = min(float(e.seconds), 3600.0)
         await asyncio.sleep(wait_time + random.uniform(0, 1))
         try:
-            entity = await client.get_entity(chat_id)
+            entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
             await client.send_file(entity, gif_id)
             return f"GIF sent to chat {chat_id}."
         except Exception as retry_e:
@@ -3197,11 +3295,13 @@ async def get_bot_info(bot_username: str) -> str:
     Get information about a bot by username.
     """
     try:
-        entity = await client.get_entity(bot_username)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(bot_username))
         if not entity:
             return f"Bot with username {bot_username} not found."
 
-        result = await client(functions.users.GetFullUserRequest(id=entity))
+        result = await _mcp_protected_read_operation(
+            lambda: client(functions.users.GetFullUserRequest(id=entity))
+        )
 
         # Create a more structured, serializable response
         if hasattr(result, "to_dict"):
@@ -3244,7 +3344,7 @@ async def set_bot_commands(bot_username: str, commands: list) -> str:
     """
     try:
         # First check if the current client is a bot
-        me = await client.get_me()
+        me = await _mcp_protected_read_operation(lambda: client.get_me())
         if not getattr(me, "bot", False):
             return "Error: This function can only be used by bot accounts. Your current Telegram account is a regular user account, not a bot."
 
@@ -3258,7 +3358,7 @@ async def set_bot_commands(bot_username: str, commands: list) -> str:
         ]
 
         # Get the bot entity
-        bot = await client.get_entity(bot_username)
+        bot = await _mcp_protected_read_operation(lambda: client.get_entity(bot_username))
 
         # Set the commands with proper scope
         await client(
@@ -3285,8 +3385,10 @@ async def get_history(chat_id: Union[int, str], limit: int = 100) -> str:
     Get full chat history (up to limit).
     """
     try:
-        entity = await client.get_entity(chat_id)
-        messages = await client.get_messages(entity, limit=limit)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
+        messages = await _mcp_protected_read_operation(
+            lambda: client.get_messages(entity, limit=limit)
+        )
 
         lines = []
         for msg in messages:
@@ -3311,9 +3413,13 @@ async def get_user_photos(user_id: Union[int, str], limit: int = 10) -> str:
     Get profile photos of a user.
     """
     try:
-        user = await client.get_entity(user_id)
-        photos = await client(
-            functions.photos.GetUserPhotosRequest(user_id=user, offset=0, max_id=0, limit=limit)
+        user = await _mcp_protected_read_operation(lambda: client.get_entity(user_id))
+        photos = await _mcp_protected_read_operation(
+            lambda: client(
+                functions.photos.GetUserPhotosRequest(
+                    user_id=user, offset=0, max_id=0, limit=limit
+                )
+            )
         )
         return json.dumps([p.id for p in photos.photos], indent=2)
     except Exception as e:
@@ -3329,7 +3435,7 @@ async def get_user_status(user_id: Union[int, str]) -> str:
     Get the online status of a user.
     """
     try:
-        user = await client.get_entity(user_id)
+        user = await _mcp_protected_read_operation(lambda: client.get_entity(user_id))
         return str(user.status)
     except Exception as e:
         return log_and_format_error("get_user_status", e, user_id=user_id)
@@ -3344,15 +3450,17 @@ async def get_recent_actions(chat_id: Union[int, str]) -> str:
     Get recent admin actions (admin log) in a group or channel.
     """
     try:
-        result = await client(
-            functions.channels.GetAdminLogRequest(
-                channel=chat_id,
-                q="",
-                events_filter=None,
-                admins=[],
-                max_id=0,
-                min_id=0,
-                limit=20,
+        result = await _mcp_protected_read_operation(
+            lambda: client(
+                functions.channels.GetAdminLogRequest(
+                    channel=chat_id,
+                    q="",
+                    events_filter=None,
+                    admins=[],
+                    max_id=0,
+                    min_id=0,
+                    limit=20,
+                )
             )
         )
 
@@ -3375,17 +3483,21 @@ async def get_pinned_messages(chat_id: Union[int, str]) -> str:
     Get all pinned messages in a chat.
     """
     try:
-        entity = await client.get_entity(chat_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
 
         # Use correct filter based on Telethon version
         try:
             # Try newer Telethon approach
             from telethon.tl.types import InputMessagesFilterPinned
 
-            messages = await client.get_messages(entity, filter=InputMessagesFilterPinned())
+            messages = await _mcp_protected_read_operation(
+                lambda: client.get_messages(entity, filter=InputMessagesFilterPinned())
+            )
         except (ImportError, AttributeError):
             # Fallback - try without filter and manually filter pinned
-            all_messages = await client.get_messages(entity, limit=50)
+            all_messages = await _mcp_protected_read_operation(
+                lambda: client.get_messages(entity, limit=50)
+            )
             messages = [m for m in all_messages if getattr(m, "pinned", False)]
 
         if not messages:
@@ -3432,7 +3544,7 @@ async def create_poll(
         close_date: Optional close date in ISO format (YYYY-MM-DD HH:MM:SS)
     """
     try:
-        entity = await client.get_entity(chat_id)
+        entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
 
         # Validate options
         if len(options) < 2:
@@ -3483,7 +3595,7 @@ async def create_poll(
         wait_time = min(float(e.seconds), 3600.0)
         await asyncio.sleep(wait_time + random.uniform(0, 1))
         try:
-            entity = await client.get_entity(chat_id)
+            entity = await _mcp_protected_read_operation(lambda: client.get_entity(chat_id))
             from telethon.tl.types import InputMediaPoll, Poll, PollAnswer, TextWithEntities
             poll = Poll(
                 id=random.randint(0, 2**63 - 1),
@@ -3654,13 +3766,15 @@ async def get_message_reactions(
     try:
         from telethon.tl.types import ReactionEmoji, ReactionCustomEmoji
 
-        peer = await client.get_input_entity(chat_id)
+        peer = await _mcp_protected_read_operation(lambda: client.get_input_entity(chat_id))
 
-        result = await client(
-            functions.messages.GetMessageReactionsListRequest(
-                peer=peer,
-                id=message_id,
-                limit=limit,
+        result = await _mcp_protected_read_operation(
+            lambda: client(
+                functions.messages.GetMessageReactionsListRequest(
+                    peer=peer,
+                    id=message_id,
+                    limit=limit,
+                )
             )
         )
 
@@ -3762,7 +3876,9 @@ async def get_drafts() -> str:
     Returns a list of drafts with their chat info and message content.
     """
     try:
-        result = await client(functions.messages.GetAllDraftsRequest())
+        result = await _mcp_protected_read_operation(
+            lambda: client(functions.messages.GetAllDraftsRequest())
+        )
 
         # The result contains updates with draft info
         drafts_info = []

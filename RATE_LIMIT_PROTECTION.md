@@ -49,10 +49,37 @@
 - **120 редактирований в час:** Отслеживание и блокировка при превышении
 - **Применяется к:** `edit_message()`
 
-### 6. Exponential Backoff
+### 6. Защита операций чтения
+- **Глобальный rate limit:** Минимум 0.2 сек между любыми запросами (включая чтение)
+- **Обработка FloodWaitError:** Автоматическое ожидание и повтор при FLOOD_WAIT ошибках
+- **Exponential backoff:** При ошибках чтения делается до 3 попыток с увеличивающейся задержкой
+- **Реальные повторные попытки:** `_mcp_protected_read_operation()` принимает callable (lambda), что позволяет создавать новый coroutine на каждую попытку для корректной работы retry
+- **Применяется к:**
+  - `get_messages()` - получение сообщений с пагинацией
+  - `get_history()` - получение истории чата
+  - `search_messages()` - поиск сообщений
+  - `list_messages()` - список сообщений с фильтрами
+  - `get_message_context()` - контекст вокруг сообщения
+  - `get_pinned_messages()` - закрепленные сообщения
+  - `get_media_info()` - информация о медиа
+  - `download_media()` - скачивание медиа
+  - `list_topics()` - список топиков форума
+  - `get_user_photos()` - фото пользователя
+  - `get_user_status()` - статус пользователя
+  - `get_recent_actions()` - последние действия админов
+  - `search_public_chats()` - поиск публичных чатов
+  - `resolve_username()` - разрешение username
+  - `export_contacts()` - экспорт контактов
+  - `get_blocked_users()` - список заблокированных
+  - `get_entity()` - получение информации о сущности (используется везде)
+  - `get_dialogs()` - список диалогов
+  - И другие операции чтения
+
+### 7. Exponential Backoff
 - При ошибках запрос повторяется с увеличивающейся задержкой
 - Формула: `wait_time = retry_after * (2 ^ attempt) + jitter`
 - Максимум 3 попытки
+- Применяется как к операциям записи, так и к операциям чтения
 
 ## Архитектура защиты
 
@@ -208,17 +235,27 @@ except (RateLimitError, FloodWaitError) as e:
 ✅ **Соблюдение всех лимитов**:
 - 1 сообщение/сек в чат (для всех типов отправки: текст, файлы, голос, стикеры, GIF, опросы, пересылка, ответы)
 - 5 редактирований/сек, 120/час
-- ~5 запросов/сек глобально (настраиваемо)
+- ~5 запросов/сек глобально (настраиваемо) - применяется ко ВСЕМ операциям (чтение и запись)
 - Реакции защищены общим rate limiting
+- Все операции чтения защищены глобальным rate limit и обработкой FloodWaitError
 
 ✅ **Защищенные методы в MCP сервере** (`main.py`):
-- `send_message`, `send_file`, `send_voice`, `send_sticker`, `send_gif`
-- `forward_message`, `reply_to_message`, `create_poll`
-- `edit_message`
-- `send_reaction`, `remove_reaction` (общий rate limit)
+- **Операции записи:**
+  - `send_message`, `send_file`, `send_voice`, `send_sticker`, `send_gif`
+  - `forward_message`, `reply_to_message`, `create_poll`
+  - `edit_message`
+  - `send_reaction`, `remove_reaction` (общий rate limit)
+- **Операции чтения:**
+  - `get_messages`, `get_history`, `search_messages`, `list_messages`
+  - `get_message_context`, `get_pinned_messages`, `get_media_info`
+  - `download_media`, `list_topics`, `get_user_photos`, `get_user_status`
+  - `get_recent_actions`, `search_public_chats`, `resolve_username`
+  - `export_contacts`, `get_blocked_users`, `get_dialogs`
+  - `get_entity` (используется во всех методах)
 
 ✅ **Защищенные методы в HTTP API** (`telegram_core.py`):
-- `send_message`, `forward_message`, `edit_message`
+- **Операции записи:** `send_message`, `forward_message`, `edit_message`
+- **Операции чтения:** `get_messages` (с обработкой FloodWaitError)
 
 ✅ **Защищенные методы в Python клиенте** (`telegram_client.py`):
 - Все методы отправки и редактирования через единый `_request()` метод

@@ -422,9 +422,30 @@ class TelegramCore:
             return error
 
         try:
-            entity = await self.client.get_entity(chat_id)
+            # Rate limiting protection for read operations
+            await self._wait_for_rate_limit()
+            try:
+                entity = await self.client.get_entity(chat_id)
+            except TelethonFloodWaitError as e:
+                wait_time = min(float(getattr(e, 'seconds', 0)), 3600.0)
+                if wait_time > 0:
+                    await asyncio.sleep(wait_time + random.uniform(0, 1))
+                    entity = await self.client.get_entity(chat_id)
+                else:
+                    raise
+            
+            await self._wait_for_rate_limit()
             offset = (page - 1) * page_size
-            messages = await self.client.get_messages(entity, limit=page_size, add_offset=offset)
+            try:
+                messages = await self.client.get_messages(entity, limit=page_size, add_offset=offset)
+            except TelethonFloodWaitError as e:
+                wait_time = min(float(getattr(e, 'seconds', 0)), 3600.0)
+                if wait_time > 0:
+                    await asyncio.sleep(wait_time + random.uniform(0, 1))
+                    messages = await self.client.get_messages(entity, limit=page_size, add_offset=offset)
+                else:
+                    raise
+            
             if not messages:
                 return "No messages found for this page."
             lines = []
