@@ -137,7 +137,7 @@ async def get_chats(page: int = Query(1, ge=1), page_size: int = Query(20, ge=1,
 @app.get("/chats/list", response_model=ApiResponse)
 async def list_chats(
     limit: int = Query(50, ge=1, le=500),
-    chat_type: Optional[str] = Query(None, regex="^(user|group|channel)$"),
+    chat_type: Optional[str] = Query(None, pattern="^(user|group|channel)$"),
     archived: bool = False,
     unread_only: bool = False,
 ):
@@ -230,6 +230,21 @@ async def search_messages(request: SearchMessagesRequest):
         limit=request.limit,
         from_user=request.from_user,
     )
+    return make_response(result)
+
+
+@app.get("/chats/{chat_id}/messages/{message_id}/media", response_model=ApiResponse)
+async def download_media(
+    chat_id: str, 
+    message_id: int,
+    output_path: Optional[str] = Query(None, description="Path to save the media file. Default: /home/eyurc/clawd/media/")
+):
+    """Download media from a message."""
+    try:
+        parsed_id = int(chat_id)
+    except ValueError:
+        parsed_id = chat_id
+    result = await telegram.download_media(parsed_id, message_id, output_path=output_path)
     return make_response(result)
 
 

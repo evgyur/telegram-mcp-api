@@ -1084,6 +1084,72 @@ class TelegramCore:
         except Exception as e:
             return log_and_format_error("clear_draft", e, chat_id=chat_id)
 
+    # ==================== Media Operations ====================
+
+    async def download_media(
+        self, chat_id: Union[int, str], message_id: int, output_path: Optional[str] = None
+    ) -> str:
+        """Download media from a message."""
+        chat_id, error = validate_ids("chat_id", chat_id)
+        if error:
+            return error
+
+        try:
+            # await self._wait_for_rate_limit()  # Закомментировано для отладки
+            try:
+                entity = await self.client.get_entity(chat_id)
+            except TelethonFloodWaitError as e:
+                wait_time = min(float(getattr(e, 'seconds', 0)), 3600.0)
+                if wait_time > 0:
+                    await asyncio.sleep(wait_time + random.uniform(0, 1))
+                    entity = await self.client.get_entity(chat_id)
+                else:
+                    raise
+            
+            # await self._wait_for_rate_limit()  # Закомментировано для отладки
+            try:
+                message = await self.client.get_messages(entity, ids=message_id)
+            except TelethonFloodWaitError as e:
+                wait_time = min(float(getattr(e, 'seconds', 0)), 3600.0)
+                if wait_time > 0:
+                    await asyncio.sleep(wait_time + random.uniform(0, 1))
+                    message = await self.client.get_messages(entity, ids=message_id)
+                else:
+                    raise
+            
+            if not message:
+                return json.dumps({"success": False, "error": "Message not found"})
+            
+            if not message.media:
+                return json.dumps({"success": False, "error": "Message has no media"})
+            
+            if not output_path:
+                # Дефолтный путь в доступную директорию
+                default_dir = "/home/eyurc/clawd/media"
+                os.makedirs(default_dir, exist_ok=True)
+                ext = ".ogg"
+                if hasattr(message.media, 'document') and message.media.document:
+                    for attr in message.media.document.attributes:
+                        if hasattr(attr, 'file_name') and attr.file_name:
+                            ext = os.path.splitext(attr.file_name)[1] or ext
+                            break
+                output_path = os.path.join(default_dir, f"tg_media_{chat_id}_{message_id}{ext}")
+            else:
+                # Если путь указан, убедимся что директория существует
+                output_dir = os.path.dirname(output_path)
+                if output_dir:
+                    os.makedirs(output_dir, exist_ok=True)
+            
+            downloaded_path = await self.client.download_media(message, output_path)
+            
+            if downloaded_path:
+                return json.dumps({"success": True, "path": downloaded_path})
+            else:
+                return json.dumps({"success": False, "error": "Failed to download"})
+                
+        except Exception as e:
+            return log_and_format_error("download_media", e, chat_id=chat_id, message_id=message_id)
+
 
 # Global singleton instance
 telegram = TelegramCore()
