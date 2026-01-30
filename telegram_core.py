@@ -197,6 +197,25 @@ def format_message(message) -> Dict[str, Any]:
         result["has_media"] = True
         result["media_type"] = type(message.media).__name__
 
+    # Extract entities with URLs (TextUrl type)
+    if message.entities:
+        entities_list = []
+        text = message.message or ""
+        for entity in message.entities:
+            entity_info = {
+                "type": type(entity).__name__,
+                "offset": entity.offset,
+                "length": entity.length,
+                "text": text[entity.offset:entity.offset + entity.length] if text else "",
+            }
+            if hasattr(entity, "url") and entity.url:
+                entity_info["url"] = entity.url
+            if hasattr(entity, "user_id") and entity.user_id:
+                entity_info["user_id"] = entity.user_id
+            entities_list.append(entity_info)
+        if entities_list:
+            result["entities"] = entities_list
+
     return result
 
 
@@ -412,6 +431,75 @@ class TelegramCore:
             return log_and_format_error("get_chat", e, chat_id=chat_id)
 
     # ==================== Message Operations ====================
+
+    async def get_message(
+        self, chat_id: Union[int, str], message_id: int
+    ) -> str:
+        """Get a single message by ID from a specific chat."""
+        chat_id, error = validate_ids("chat_id", chat_id)
+        if error:
+            return error
+
+        try:
+            await self._wait_for_rate_limit()
+            try:
+                entity = await self.client.get_entity(chat_id)
+            except TelethonFloodWaitError as e:
+                wait_time = min(float(getattr(e, 'seconds', 0)), 3600.0)
+                if wait_time > 0:
+                    await asyncio.sleep(wait_time + random.uniform(0, 1))
+                    entity = await self.client.get_entity(chat_id)
+                else:
+                    raise
+            
+            try:
+                message = await self.client.get_messages(entity, ids=message_id)
+            except TelethonFloodWaitError as e:
+                wait_time = min(float(getattr(e, 'seconds', 0)), 3600.0)
+                if wait_time > 0:
+                    await asyncio.sleep(wait_time + random.uniform(0, 1))
+                    message = await self.client.get_messages(entity, ids=message_id)
+                else:
+                    raise
+            
+            if not message:
+                return "Message not found"
+            
+            # Форматируем сообщение
+            sender_name = get_sender_name(message)
+            
+            result = {
+                "id": message.id,
+                "sender": sender_name,
+                "date": message.date.isoformat(),
+                "text": message.message or "",
+                "reply_to": message.reply_to.reply_to_msg_id if message.reply_to else None,
+                "has_media": bool(message.media),
+                "media_type": type(message.media).__name__ if message.media else None,
+            }
+            # Extract entities with URLs (TextUrl type)
+            if message.entities:
+                entities_list = []
+                text = message.message or ""
+                for entity in message.entities:
+                    entity_info = {
+                        "type": type(entity).__name__,
+                        "offset": entity.offset,
+                        "length": entity.length,
+                        "text": text[entity.offset:entity.offset + entity.length] if text else "",
+                    }
+                    if hasattr(entity, "url") and entity.url:
+                        entity_info["url"] = entity.url
+                    if hasattr(entity, "user_id") and entity.user_id:
+                        entity_info["user_id"] = entity.user_id
+                    entities_list.append(entity_info)
+                if entities_list:
+                    result["entities"] = entities_list
+            # Возвращаем JSON строку, make_response обернёт в success/error
+            return json.dumps(result, indent=2, default=json_serializer)
+            
+        except Exception as e:
+            return log_and_format_error("get_message", e, chat_id=chat_id, message_id=message_id)
 
     async def get_messages(
         self, chat_id: Union[int, str], page: int = 1, page_size: int = 20
@@ -1140,7 +1228,14 @@ class TelegramCore:
                 if output_dir:
                     os.makedirs(output_dir, exist_ok=True)
             
-            downloaded_path = await self.client.download_media(message, output_path)
+            # Добавляем таймаут для скачивания (5 минут)
+            try:
+                downloaded_path = await asyncio.wait_for(
+                    self.client.download_media(message, output_path),
+                    timeout=300.0
+                )
+            except asyncio.TimeoutError:
+                return json.dumps({"success": False, "error": "Download timeout (5 minutes exceeded)"})
             
             if downloaded_path:
                 return json.dumps({"success": True, "path": downloaded_path})
