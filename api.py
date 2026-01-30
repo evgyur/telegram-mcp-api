@@ -176,6 +176,20 @@ async def get_messages(
     return make_response(result)
 
 
+@app.get("/chats/{chat_id}/messages/{message_id}", response_model=ApiResponse)
+async def get_message(
+    chat_id: str,
+    message_id: int,
+):
+    """Get a single message by ID from a chat."""
+    try:
+        parsed_id = int(chat_id)
+    except ValueError:
+        parsed_id = chat_id
+    result = await telegram.get_message(parsed_id, message_id)
+    return make_response(result)
+
+
 @app.post("/messages/send", response_model=ApiResponse)
 async def send_message(request: SendMessageRequest):
     """Send a message to a chat."""
